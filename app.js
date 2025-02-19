@@ -1,4 +1,3 @@
-// app.js
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -17,7 +16,7 @@ server.listen(PORT, () => {
 // ----------------------
 // Game State Variables
 // ----------------------
-let players = {}; // { id: { id, x, y, mark, role, alive, isBot, guess, ready } }
+let players = {}; // { id: { id, x, y, z, mark, role, alive, isBot, guess, ready } }
 const marks = ["Spades", "Diamonds", "Clubs", "Hearts"];
 const roundDuration = 5 * 60 * 1000;       // 5 minutes in ms
 const confinementDuration = 1 * 60 * 1000;   // 1 minute in ms
@@ -36,16 +35,14 @@ function assignRandomMark() {
 }
 
 function assignJackOfHearts() {
-  // If no player has the Jack role, assign one randomly among alive players.
   let alivePlayers = [];
   for (let id in players) {
     if (players[id].alive) {
       alivePlayers.push(players[id]);
     }
   }
-  // If a Jack is already assigned, leave it.
-  for (let player of alivePlayers) {
-    if (player.role === 'Jack') return;
+  for (let i = 0; i < alivePlayers.length; i++) {
+    if (alivePlayers[i].role === 'Jack') return;
   }
   if (alivePlayers.length > 0) {
     let randomIndex = Math.floor(Math.random() * alivePlayers.length);
@@ -59,7 +56,6 @@ function assignJackOfHearts() {
 // Waiting Room Functions
 // ----------------------
 function updateWaitingRoom() {
-  // Build an object of ready states for non-bot players.
   let readyStates = {};
   for (let id in players) {
     if (!players[id].isBot) {
@@ -70,7 +66,6 @@ function updateWaitingRoom() {
 }
 
 function checkAllReady() {
-  // Check if all non-bot players (that are alive) are ready.
   let allReady = true;
   for (let id in players) {
     if (!players[id].isBot && players[id].alive && players[id].ready !== true) {
@@ -92,25 +87,20 @@ function startRound() {
   gameInProgress = true;
   console.log(`Starting round ${currentRound}`);
 
-  // Reset each alive player's guess and assign a new mark.
   for (let id in players) {
     if (players[id].alive) {
       players[id].guess = null;
       players[id].mark = assignRandomMark();
-      // Reset ready state for subsequent rounds if desired.
       if (!players[id].isBot) {
         players[id].ready = false;
       }
     }
   }
 
-  // Ensure a Jack of Hearts is assigned.
   assignJackOfHearts();
 
-  // Notify all players that a new round has started.
   io.emit('roundStarted', { round: currentRound, duration: roundDuration });
 
-  // Set a timer so that the confinement phase begins after (roundDuration - confinementDuration)
   if (roundTimer) clearTimeout(roundTimer);
   roundTimer = setTimeout(() => {
     startConfinement();
@@ -121,7 +111,6 @@ function startConfinement() {
   console.log("Confinement phase started.");
   io.emit('confinementStarted', { duration: confinementDuration });
 
-  // For bots: simulate guess submission after a random delay during confinement.
   for (let id in players) {
     if (players[id].alive && players[id].isBot) {
       let delay = Math.floor(Math.random() * confinementDuration);
@@ -136,7 +125,6 @@ function startConfinement() {
     }
   }
 
-  // After confinement duration, evaluate all guesses.
   if (confinementTimer) clearTimeout(confinementTimer);
   confinementTimer = setTimeout(() => {
     evaluateGuesses();
@@ -145,8 +133,6 @@ function startConfinement() {
 
 function evaluateGuesses() {
   console.log("Evaluating guesses...");
-
-  // Check each alive player's guess.
   for (let id in players) {
     let player = players[id];
     if (player.alive) {
@@ -164,8 +150,6 @@ function evaluateGuesses() {
     }
   }
 
-  // Game ending conditions:
-  // 1. If the Jack of Hearts is eliminated, surviving players win.
   let jackAlive = false;
   for (let id in players) {
     if (players[id].role === 'Jack' && players[id].alive) {
@@ -180,7 +164,6 @@ function evaluateGuesses() {
     return;
   }
 
-  // 2. If only two players remain (with the Jack), then only the Jack wins.
   let alivePlayers = [];
   for (let id in players) {
     if (players[id].alive) {
@@ -188,7 +171,13 @@ function evaluateGuesses() {
     }
   }
   if (alivePlayers.length === 2) {
-    let jackFound = alivePlayers.find(p => p.role === 'Jack');
+    let jackFound = null;
+    for (let i = 0; i < alivePlayers.length; i++) {
+      if (alivePlayers[i].role === 'Jack') {
+        jackFound = alivePlayers[i];
+        break;
+      }
+    }
     if (jackFound) {
       io.emit('gameOver', { message: 'Only two players remain with the Jack of Hearts. Jack wins!' });
       gameInProgress = false;
@@ -197,7 +186,6 @@ function evaluateGuesses() {
     }
   }
 
-  // Otherwise, start a new round.
   currentRound++;
   startRound();
 }
@@ -208,48 +196,44 @@ function evaluateGuesses() {
 io.on('connection', (socket) => {
   console.log(`Player connected: ${socket.id}`);
 
-  // Create a new real player.
+  // For players, assign positions within a 20x20 room (x and z between -10 and 10)
   players[socket.id] = {
     id: socket.id,
-    x: Math.floor(Math.random() * 800),
-    y: Math.floor(Math.random() * 600),
+    x: Math.random() * 20 - 10,
+    y: 0.5,
+    z: Math.random() * 20 - 10,
     mark: assignRandomMark(),
     role: null,
     alive: true,
     isBot: false,
     guess: null,
-    ready: false // Initially not ready
+    ready: false
   };
 
-  // Send all current players (including bots) to the new client.
   socket.emit('currentPlayers', players);
   socket.broadcast.emit('newPlayer', players[socket.id]);
 
-  // If we're still in the waiting room, send the current waiting status.
   if (waitingRoom) {
     updateWaitingRoom();
   } else {
-    // If game already started, send current round state.
     let elapsed = Date.now() - roundStartTime;
     let remaining = Math.max(roundDuration - elapsed, 0);
     socket.emit('roundStarted', { round: currentRound, duration: remaining });
   }
 
-  // Chat messaging.
   socket.on('chatMessage', (data) => {
     io.emit('chatMessage', { sender: players[socket.id].id, message: data.message });
   });
 
-  // Movement updates.
   socket.on('playerMovement', (movementData) => {
     if (players[socket.id]) {
       players[socket.id].x = movementData.x;
       players[socket.id].y = movementData.y;
+      players[socket.id].z = movementData.z;
       socket.broadcast.emit('playerMoved', players[socket.id]);
     }
   });
 
-  // Guess submission during confinement.
   socket.on('submitGuess', (data) => {
     if (players[socket.id] && players[socket.id].alive) {
       players[socket.id].guess = data.guess;
@@ -258,7 +242,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Ready event from waiting room.
   socket.on('playerReady', () => {
     if (players[socket.id] && !players[socket.id].isBot) {
       players[socket.id].ready = true;
@@ -286,42 +269,40 @@ function createBots(numBots) {
     let botId = 'bot_' + i;
     players[botId] = {
       id: botId,
-      x: Math.floor(Math.random() * 800),
-      y: Math.floor(Math.random() * 600),
+      x: Math.random() * 20 - 10,
+      y: 0.5,
+      z: Math.random() * 20 - 10,
       mark: assignRandomMark(),
       role: null,
       alive: true,
       isBot: true,
       guess: null,
-      ready: true // Bots are automatically ready
+      ready: true
     };
     io.emit('newPlayer', players[botId]);
     console.log(`Bot added: ${botId}`);
   }
 }
 
-// Create (for example) 3 bots for testing.
+// Create 3 bots for testing.
 createBots(3);
 
-// Update bot positions periodically using a random-walk algorithm.
 setInterval(() => {
   for (let id in players) {
     if (players[id].isBot && players[id].alive) {
       let bot = players[id];
-      const speed = 2;
+      const speed = 0.2; // smaller speed for 3D room
       let dx = (Math.random() - 0.5) * speed;
-      let dy = (Math.random() - 0.5) * speed;
+      let dz = (Math.random() - 0.5) * speed;
       bot.x += dx;
-      bot.y += dy;
-      bot.x = Math.max(0, Math.min(800, bot.x));
-      bot.y = Math.max(0, Math.min(600, bot.y));
+      bot.z += dz;
+      // Clamp positions within -10 to 10
+      bot.x = Math.max(-10, Math.min(10, bot.x));
+      bot.z = Math.max(-10, Math.min(10, bot.z));
       io.emit('playerMoved', bot);
     }
   }
 }, 50);
 
-// For tracking round start time (used for catch-up)
+// For tracking round start time.
 let roundStartTime = Date.now();
-
-// The game will not start until all non-bot players are ready.
-// Once all are ready, checkAllReady() will call startRound() via the 'gameStarting' event.
