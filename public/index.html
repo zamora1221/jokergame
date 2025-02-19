@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>3D Multiplayer Jail Game with Rooms & Doors</title>
+  <title>3D Multiplayer Jail Game with Rooms, Doors & Voice Chat</title>
   <style>
     body { margin: 0; overflow: hidden; }
     canvas { display: block; }
@@ -15,22 +15,6 @@
       font-family: Arial, sans-serif;
       z-index: 10;
     }
-    /* Waiting room overlay styles */
-    #waitingRoom {
-      position: absolute;
-      top: 0; left: 0;
-      width: 100%; height: 100%;
-      background: rgba(0,0,0,0.8);
-      color: #fff;
-      font-family: Arial, sans-serif;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      z-index: 100;
-    }
-    #playersList { margin-bottom: 20px; max-height: 200px; overflow-y: auto; }
-    button { padding: 10px 20px; font-size: 16px; }
     /* Chat/Guess box styling */
     #guessContainer { margin-top: 10px; }
   </style>
@@ -39,7 +23,7 @@
   <!-- UI Message -->
   <div id="uiContainer">
     <div id="gameStatus">Connecting...</div>
-    <div id="gameMessage"></div>
+    <div id="gameMessage">Walk to a booth and press E to ready up.</div>
     <div id="timer"></div>
     <!-- Guess submission UI; initially hidden -->
     <div id="guessContainer" style="display:none;">
@@ -47,16 +31,11 @@
       <button id="submitGuessButton">Submit Guess</button>
     </div>
   </div>
-  <!-- Waiting Room Overlay -->
-  <div id="waitingRoom">
-    <h2>Waiting Room</h2>
-    <div id="playersList"></div>
-    <button id="readyButton">I'm Ready</button>
-  </div>
 
-  <!-- Include Three.js and Socket.IO -->
+  <!-- Include Three.js, SimplePeer, and Socket.IO -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="/socket.io/socket.io.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.1/simplepeer.min.js"></script>
 
   <script>
     // ====================================================
@@ -65,14 +44,15 @@
     var collisionWalls = [];    // All solid walls & closed doors
     var doorObjects = {};       // Doors keyed by a string ID
     var remotePlayers = {};     // Remote players and bots (keyed by their ID)
-    var booths = [];            // Booth objects (for guess submission in cells)
+    var booths = [];            // Booth objects (yellow boxes in cells)
     var localPlayer;            // Our local (hidden) player
     var camera, scene, renderer;  // Three.js essentials
 
-    // Global flag: are we in confinement phase?
+    // Global flags.
     var inConfinementPhase = false;
+    var waitingRoom = true; // Initially waiting for player to ready up
 
-    // UI Elements for messages and countdown timer.
+    // UI Elements.
     var gameStatusEl = document.getElementById('gameStatus');
     var gameMessageEl = document.getElementById('gameMessage');
     var timerEl = document.getElementById('timer');
@@ -82,41 +62,17 @@
     var countdownInterval = null;
 
     // ====================================================
-    // Socket.IO & Waiting Room Setup
+    // Socket.IO Setup
     // ====================================================
     var socket = io();
     socket.on('connect', function() {
       console.log('Connected with ID:', socket.id);
       gameStatusEl.textContent = "Connected. Waiting for game start...";
     });
-    var waitingRoomDiv = document.getElementById("waitingRoom");
-    var playersList = document.getElementById("playersList");
-    var readyButton = document.getElementById("readyButton");
-    readyButton.addEventListener('click', function() {
-      socket.emit('playerReady');
-      readyButton.disabled = true;
-      readyButton.textContent = "Waiting for others...";
-    });
-    socket.on('waitingRoomUpdate', function(readyStates) {
-      playersList.innerHTML = '';
-      for (var id in readyStates) {
-        if (readyStates.hasOwnProperty(id)) {
-          var div = document.createElement('div');
-          div.textContent = id + ': ' + (readyStates[id] ? 'Ready' : 'Not Ready');
-          playersList.appendChild(div);
-        }
-      }
-    });
-    socket.on('gameStarting', function() {
-      waitingRoomDiv.style.display = 'none';
-      gameMessageEl.textContent = "Game Starting...";
-    });
 
-    // ----------------------------------------------------
-    // Game Events: round and confinement phases
-    // ----------------------------------------------------
+    // Game event listeners.
     socket.on('roundStarted', function(data) {
-      // data: { round: number, duration: ms }
+      waitingRoom = false;  // Game has started.
       inConfinementPhase = false;
       gameMessageEl.textContent = "Round " + data.round + " started!";
       startCountdown(data.duration);
@@ -127,7 +83,7 @@
       inConfinementPhase = true;
       gameMessageEl.textContent = "Confinement Phase: Go to a cell and press E to guess your mark!";
       startCountdown(data.duration);
-      // Note: The guess UI will be triggered when the player presses E near a booth.
+      // Guess UI will appear when player is near a booth and presses E.
     });
 
     socket.on('guessReceived', function(data) {
@@ -152,6 +108,14 @@
 
     socket.on('jackAssigned', function(data) {
       console.log("Jack of Hearts assigned to: " + data.id);
+    });
+
+    // This listener informs the player if they are the Jack.
+    socket.on('jackRole', function(data) {
+      console.log("jackRole event received:", data);
+      setTimeout(function(){
+        gameMessageEl.textContent = "You are the Jack of Hearts! Your mark is " + data.mark;
+      }, 500);
     });
 
     // Countdown timer function.
@@ -196,7 +160,7 @@
     var directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
     directionalLight.position.set(10,10,5);
     scene.add(directionalLight);
-    // Ground plane
+    // Ground plane.
     var groundGeom = new THREE.PlaneGeometry(roomWidth, roomDepth);
     var groundMat = new THREE.MeshPhongMaterial({ color: 0x555555, side: THREE.DoubleSide });
     var ground = new THREE.Mesh(groundGeom, groundMat);
@@ -221,23 +185,23 @@
     }
 
     // ====================================================
-    // Jail Layout: Big Room & Side Rooms (Cells)
+    // Jail Layout: Big Room & Cells (Side Rooms)
     // ====================================================
-    // Outer walls of big room:
-    addWall(0, 2.5, -halfDepth, roomWidth, 5, 1); // North wall at z = -10
-    addWall(0, 2.5, halfDepth, roomWidth, 5, 1);   // South wall at z = 10
-    addWall(-halfWidth, 2.5, 0, roomDepth, 5, 1, Math.PI/2); // West wall at x = -10
-    addWall(halfWidth, 2.5, 0, roomDepth, 5, 1, Math.PI/2);   // East wall at x = 10
+    // Outer walls.
+    addWall(0, 2.5, -halfDepth, roomWidth, 5, 1);
+    addWall(0, 2.5, halfDepth, roomWidth, 5, 1);
+    addWall(-halfWidth, 2.5, 0, roomDepth, 5, 1, Math.PI/2);
+    addWall(halfWidth, 2.5, 0, roomDepth, 5, 1, Math.PI/2);
 
-    // Side Rooms (Cells): Using the north wall as divider.
+    // Cells on both sides (using north wall as divider).
     var numRooms = 5;
     var roomSize = 4;
-    // West side rooms.
+    // West side cells.
     for (var i = 0; i < numRooms; i++) {
       var z_center = -halfDepth + roomSize/2 + i * roomSize;
-      addWall(-8, 1.5, z_center, roomSize, 3, 0.2); // West wall of cell
-      addWall(-8, 1.5, z_center - roomSize/2, roomSize, 3, 0.2); // North wall
-      addWall(-8, 1.5, z_center + roomSize/2, roomSize, 3, 0.2); // South wall
+      addWall(-8, 1.5, z_center, roomSize, 3, 0.2);
+      addWall(-8, 1.5, z_center - roomSize/2, roomSize, 3, 0.2);
+      addWall(-8, 1.5, z_center + roomSize/2, roomSize, 3, 0.2);
       var doorGeom = new THREE.BoxGeometry(1, 3, 0.2);
       var doorMat = new THREE.MeshPhongMaterial({ color: 0x4444ff });
       var door = new THREE.Mesh(doorGeom, doorMat);
@@ -251,7 +215,7 @@
       door.userData.box = new THREE.Box3().setFromObject(door);
       collisionWalls.push(door);
       doorObjects["west_"+i] = door;
-      // Add a booth (yellow box) in the center of the cell.
+      // Booth for readying up.
       var boothGeom = new THREE.BoxGeometry(0.5, 0.5, 0.5);
       var boothMat = new THREE.MeshPhongMaterial({ color: 0xffff00 });
       var booth = new THREE.Mesh(boothGeom, boothMat);
@@ -259,12 +223,12 @@
       scene.add(booth);
       booths.push(booth);
     }
-    // East side rooms.
+    // East side cells.
     for (var i = 0; i < numRooms; i++) {
       var z_center = -halfDepth + roomSize/2 + i * roomSize;
-      addWall(8, 1.5, z_center, roomSize, 3, 0.2); // East wall of cell
-      addWall(8, 1.5, z_center - roomSize/2, roomSize, 3, 0.2); // North wall
-      addWall(8, 1.5, z_center + roomSize/2, roomSize, 3, 0.2); // South wall
+      addWall(8, 1.5, z_center, roomSize, 3, 0.2);
+      addWall(8, 1.5, z_center - roomSize/2, roomSize, 3, 0.2);
+      addWall(8, 1.5, z_center + roomSize/2, roomSize, 3, 0.2);
       var doorGeom = new THREE.BoxGeometry(1, 3, 0.2);
       var doorMat = new THREE.MeshPhongMaterial({ color: 0x4444ff });
       var door = new THREE.Mesh(doorGeom, doorMat);
@@ -278,7 +242,7 @@
       door.userData.box = new THREE.Box3().setFromObject(door);
       collisionWalls.push(door);
       doorObjects["east_"+i] = door;
-      // Add a booth in the center of the cell.
+      // Booth.
       var boothGeom = new THREE.BoxGeometry(0.5, 0.5, 0.5);
       var boothMat = new THREE.MeshPhongMaterial({ color: 0xffff00 });
       var booth = new THREE.Mesh(boothGeom, boothMat);
@@ -303,20 +267,16 @@
       context.font = fontsize + "px " + fontface;
       var metrics = context.measureText(message);
       var textWidth = metrics.width;
-      
-      // Set canvas size.
+
       canvas.width = textWidth + borderThickness * 2;
       canvas.height = fontsize * 1.4 + borderThickness * 2;
-      
+
       context.font = fontsize + "px " + fontface;
-      // Background
       context.fillStyle = "rgba(" + backgroundColor.r + "," + backgroundColor.g + "," + backgroundColor.b + "," + backgroundColor.a + ")";
       context.fillRect(0, 0, canvas.width, canvas.height);
-      // Border
       context.strokeStyle = "rgba(" + borderColor.r + "," + borderColor.g + "," + borderColor.b + "," + borderColor.a + ")";
       context.lineWidth = borderThickness;
       context.strokeRect(0, 0, canvas.width, canvas.height);
-      // Text
       context.fillStyle = "rgba(0, 0, 0, 1.0)";
       context.textAlign = "center";
       context.textBaseline = "middle";
@@ -333,8 +293,7 @@
     // ====================================================
     // Character Creation (for both bots and actual players)
     // ====================================================
-    // This function creates a stick-figure character.
-    // color: the body color (e.g., 0xffaa00 for bots, 0xff0000 for players)
+    // Creates a stick-figure character with the given color.
     function createStickFigureCharacter(id, position, mark, color) {
       var character = new THREE.Group();
 
@@ -407,7 +366,6 @@
     // Player & Bot Setup
     // ====================================================
     // Local player: hidden green cube with attached camera.
-    // (The local player remains hidden; other players see the stick-figure version.)
     localPlayer = new THREE.Mesh(new THREE.BoxGeometry(1,1,1), new THREE.MeshPhongMaterial({ color: 0x00ff00 }));
     localPlayer.position.set(0,0,0);
     localPlayer.visible = false;
@@ -415,12 +373,11 @@
     localPlayer.add(camera);
     camera.position.set(0,1.6,0);
 
-    // Remote players and bots are now created using the stick-figure style.
+    // Remote players and bots.
     socket.on('currentPlayers', function(playersData) {
       for (var id in playersData) {
         if (id !== socket.id) {
           var pos = new THREE.Vector3(playersData[id].x, playersData[id].y || 0.5, playersData[id].z || 0);
-          // Use orange for bots and red for actual players.
           var color = (id.indexOf("bot_") === 0) ? 0xffaa00 : 0xff0000;
           var character = createStickFigureCharacter(id, pos, playersData[id].mark, color);
           scene.add(character);
@@ -446,7 +403,7 @@
     });
 
     // ====================================================
-    // Stick Figure Characters Movement (Bots Animation)
+    // Characters Movement (Bots Animation)
     // ====================================================
     function updateBots() {
       for (var id in remotePlayers) {
@@ -457,12 +414,11 @@
           if (character.userData) {
             character.userData.walkPhase += 0.1;
             var amp = 0.3;
-            // For simplicity, animate arms and legs:
             if (character.children.length >= 6) {
-              character.children[2].rotation.x = Math.sin(character.userData.walkPhase)*amp; // leftArm
-              character.children[3].rotation.x = -Math.sin(character.userData.walkPhase)*amp; // rightArm
-              character.children[4].rotation.x = -Math.sin(character.userData.walkPhase)*amp; // leftLeg
-              character.children[5].rotation.x = Math.sin(character.userData.walkPhase)*amp; // rightLeg
+              character.children[2].rotation.x = Math.sin(character.userData.walkPhase)*amp;
+              character.children[3].rotation.x = -Math.sin(character.userData.walkPhase)*amp;
+              character.children[4].rotation.x = -Math.sin(character.userData.walkPhase)*amp;
+              character.children[5].rotation.x = Math.sin(character.userData.walkPhase)*amp;
             }
           }
         }
@@ -473,30 +429,42 @@
     // Door & Booth Interaction
     // ====================================================
     document.addEventListener('keydown', function(event) {
-      // When pressing E:
       if (event.key === 'e' || event.key === 'E') {
-        // If in confinement phase, check if near any booth
+        // During waiting mode, check if near a booth to ready up.
+        if (waitingRoom) {
+          for (var i = 0; i < booths.length; i++) {
+            var booth = booths[i];
+            var dist = localPlayer.position.distanceTo(booth.position);
+            if (dist < 2) {
+              socket.emit('playerReady');
+              gameMessageEl.textContent = "Ready! Waiting for other players...";
+              waitingRoom = false;
+              return;
+            }
+          }
+        }
+        // During confinement phase, check for guess submission.
         if (inConfinementPhase) {
           for (var i = 0; i < booths.length; i++) {
             var booth = booths[i];
             var dist = localPlayer.position.distanceTo(booth.position);
             if (dist < 2) {
-              // Player is near a booth in a cell, so show the guess UI.
               guessContainerEl.style.display = 'block';
-              return; // Exit so we don't also toggle any doors.
+              return;
             }
           }
         }
-        // Otherwise, process door toggling as usual.
+        // Otherwise, process door toggling.
         for (var key in doorObjects) {
           var door = doorObjects[key];
           var dist = localPlayer.position.distanceTo(door.userData.closedPos);
-          if (dist < 2) { 
+          if (dist < 2) {
             toggleDoor(door);
           }
         }
       }
     });
+
     function toggleDoor(door) {
       if (!door.userData.isOpen) {
         door.position.copy(door.userData.openPos);
@@ -593,6 +561,58 @@
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
     });
+
+    // ====================================================
+    // Voice Chat Integration using SimplePeer and WebRTC
+    // ====================================================
+    var peers = {}; // To hold peer connections, keyed by remote socket ID.
+    // Get local audio stream.
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then(function(stream) {
+        window.localAudioStream = stream;
+        // When a new player connects, create a peer connection.
+        socket.on('newPlayer', function(playerInfo) {
+          if (playerInfo.id !== socket.id) {
+            // For simplicity, use a convention: if our socket id is lexicographically smaller, we are the initiator.
+            var initiator = (socket.id < playerInfo.id);
+            var peer = new SimplePeer({ initiator: initiator, trickle: false, stream: stream });
+            peer.on('signal', function(data) {
+              socket.emit('voiceSignal', { to: playerInfo.id, from: socket.id, signal: data });
+            });
+            peer.on('stream', function(remoteStream) {
+              // Create an audio element and play the remote audio stream.
+              var audio = document.createElement('audio');
+              audio.srcObject = remoteStream;
+              audio.autoplay = true;
+              document.body.appendChild(audio);
+            });
+            peers[playerInfo.id] = peer;
+          }
+        });
+        // Listen for voice signal messages.
+        socket.on('voiceSignal', function(data) {
+          if (data.to === socket.id) {
+            if (!peers[data.from]) {
+              // Create a peer if it doesn't exist.
+              var peer = new SimplePeer({ initiator: false, trickle: false, stream: stream });
+              peer.on('signal', function(signal) {
+                socket.emit('voiceSignal', { to: data.from, from: socket.id, signal: signal });
+              });
+              peer.on('stream', function(remoteStream) {
+                var audio = document.createElement('audio');
+                audio.srcObject = remoteStream;
+                audio.autoplay = true;
+                document.body.appendChild(audio);
+              });
+              peers[data.from] = peer;
+            }
+            peers[data.from].signal(data.signal);
+          }
+        });
+      })
+      .catch(function(err) {
+        console.error("Error accessing microphone: ", err);
+      });
   </script>
 </body>
 </html>
