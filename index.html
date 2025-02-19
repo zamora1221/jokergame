@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>3D Multiplayer Jail Game with Rooms & Doors</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    canvas { display: block; }
+    /* UI container for general messages */
+    #uiContainer {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: #fff;
+      font-family: Arial, sans-serif;
+      z-index: 10;
+    }
+    /* Waiting room overlay styles */
+    #waitingRoom {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: rgba(0,0,0,0.8);
+      color: #fff;
+      font-family: Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+    #playersList { margin-bottom: 20px; max-height: 200px; overflow-y: auto; }
+    button { padding: 10px 20px; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <!-- UI Message -->
+  <div id="uiContainer">
+    <div id="gameStatus">Connecting...</div>
+  </div>
+  <!-- Waiting Room Overlay -->
+  <div id="waitingRoom">
+    <h2>Waiting Room</h2>
+    <div id="playersList"></div>
+    <button id="readyButton">I'm Ready</button>
+  </div>
+
+  <!-- Include Three.js and Socket.IO -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+
+  <script>
+    // ====================================================
+    // Global Variables & Data Structures
+    // ====================================================
+    var collisionWalls = [];    // All solid walls & closed doors
+    var doorObjects = {};       // Doors keyed by a string ID
+    var remotePlayers = {};     // Remote players and bots (keyed by their ID)
+    var localPlayer;            // Our local (hidden) player
+    var camera, scene, renderer;  // Three.js essentials
+
+    // ====================================================
+    // Socket.IO & Waiting Room Setup
+    // ====================================================
+    var socket = io();
+    socket.on('connect', function() {
+      console.log('Connected with ID:', socket.id);
+      document.getElementById('gameStatus').textContent = "Connected. Waiting for game start...";
+    });
+    var waitingRoomDiv = document.getElementById("waitingRoom");
+    var playersList = document.getElementById("playersList");
+    var readyButton = document.getElementById("readyButton");
+    readyButton.addEventListener('click', function() {
+      socket.emit('playerReady');
+      readyButton.disabled = true;
+      readyButton.textContent = "Waiting for others...";
+    });
+    socket.on('waitingRoomUpdate', function(readyStates) {
+      playersList.innerHTML = '';
+      for (var id in readyStates) {
+        var div = document.createElement('div');
+        div.textContent = id + ': ' + (readyStates[id] ? 'Ready' : 'Not Ready');
+        playersList.appendChild(div);
+      }
+    });
+    socket.on('gameStarting', function() {
+      waitingRoomDiv.style.display = 'none';
+    });
+    socket.on('playerMoved', function(data) {
+      if (remotePlayers[data.id]) {
+        remotePlayers[data.id].position.set(data.x, data.y, data.z);
+      }
+    });
+
+    // ====================================================
+    // Three.js Scene Setup
+    // ====================================================
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x333333);
+    // Big room: 20m x 20m; center at (0,0)
+    var roomWidth = 20, roomDepth = 20;
+    var halfWidth = roomWidth / 2, halfDepth = roomDepth / 2;
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    var ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+    scene.add(ambientLight);
+    var directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    directionalLight.position.set(10,10,5);
+    scene.add(directionalLight);
+    // Ground plane
+    var groundGeom = new THREE.PlaneGeometry(roomWidth, roomDepth);
+    var groundMat = new THREE.MeshPhongMaterial({ color: 0x555555, side: THREE.DoubleSide });
+    var ground = new THREE.Mesh(groundGeom, groundMat);
+    ground.rotation.x = Math.PI/2;
+    scene.add(ground);
+
+    // ====================================================
+    // Helper Function: addWall
+    // Creates a wall, adds it to scene, computes bounding box, stores in collisionWalls.
+    // ====================================================
+    function addWall(x, y, z, width, height, depth, rotationY) {
+      var geom = new THREE.BoxGeometry(width, height, depth);
+      var mat = new THREE.MeshPhongMaterial({ color: 0x888888 });
+      var wall = new THREE.Mesh(geom, mat);
+      wall.position.set(x, y, z);
+      if (rotationY !== undefined) {
+        wall.rotation.y = rotationY;
+      }
+      scene.add(wall);
+      wall.userData.box = new THREE.Box3().setFromObject(wall);
+      collisionWalls.push(wall);
+      return wall;
+    }
+
+    // ====================================================
+    // Jail Layout: Big Room & Side Rooms
+    // ====================================================
+    // Outer walls of big room:
+    addWall(0, 2.5, -halfDepth, roomWidth, 5, 1); // North wall at z = -10
+    addWall(0, 2.5, halfDepth, roomWidth, 5, 1);   // South wall at z = 10
+    addWall(-halfWidth, 2.5, 0, roomDepth, 5, 1, Math.PI/2); // West wall at x = -10
+    addWall(halfWidth, 2.5, 0, roomDepth, 5, 1, Math.PI/2);   // East wall at x = 10
+
+    // We'll use the north wall (at z = -10) as the dividing wall for side rooms.
+    // Attach 5 rooms on the east side and 5 on the west side along the north wall.
+    // For simplicity, we assume that the dividing wall is the north outer wall.
+    // Each room is 4m (width) x 4m (depth). Rooms are arranged along the north wall.
+    var numRooms = 5;
+    var roomSize = 4;
+    // For west side rooms (they extend from x = -10 to -6)
+    for (var i = 0; i < numRooms; i++) {
+      var z_center = -halfDepth + roomSize/2 + i * roomSize; // from z = -10 upward
+      // Build room walls (west room: cell extends from x = -10 to -6)
+      // East wall of room will be along the dividing wall and will contain a door.
+      addWall(-8, 1.5, z_center, roomSize, 3, 0.2); // West wall of room (inside room)
+      addWall(-8, 1.5, z_center - roomSize/2, roomSize, 3, 0.2); // North wall of room
+      addWall(-8, 1.5, z_center + roomSize/2, roomSize, 3, 0.2); // South wall of room
+      // Door on east side (attached to dividing wall at x = -10)
+      var doorGeom = new THREE.BoxGeometry(1, 3, 0.2);
+      var doorMat = new THREE.MeshPhongMaterial({ color: 0x4444ff });
+      var door = new THREE.Mesh(doorGeom, doorMat);
+      door.position.set(-10, 1.5, z_center);
+      door.userData = {
+        isOpen: false,
+        closedPos: new THREE.Vector3(-10, 1.5, z_center),
+        openPos: new THREE.Vector3(-9, 1.5, z_center)
+      };
+      scene.add(door);
+      door.userData.box = new THREE.Box3().setFromObject(door);
+      collisionWalls.push(door);
+      doorObjects["west_"+i] = door;
+    }
+    // For east side rooms (they extend from x = 6 to 10)
+    for (var i = 0; i < numRooms; i++) {
+      var z_center = -halfDepth + roomSize/2 + i * roomSize;
+      // Build room walls (east room: cell extends from x = 6 to 10)
+      addWall(8, 1.5, z_center, roomSize, 3, 0.2); // East wall (inside room)
+      addWall(8, 1.5, z_center - roomSize/2, roomSize, 3, 0.2); // North wall
+      addWall(8, 1.5, z_center + roomSize/2, roomSize, 3, 0.2); // South wall
+      // Door on west side (attached to dividing wall at x = 10)
+      var doorGeom = new THREE.BoxGeometry(1, 3, 0.2);
+      var doorMat = new THREE.MeshPhongMaterial({ color: 0x4444ff });
+      var door = new THREE.Mesh(doorGeom, doorMat);
+      door.position.set(10, 1.5, z_center);
+      door.userData = {
+        isOpen: false,
+        closedPos: new THREE.Vector3(10, 1.5, z_center),
+        openPos: new THREE.Vector3(9, 1.5, z_center)
+      };
+      scene.add(door);
+      door.userData.box = new THREE.Box3().setFromObject(door);
+      collisionWalls.push(door);
+      doorObjects["east_"+i] = door;
+    }
+
+    // ====================================================
+    // Player & Bot Setup
+    // ====================================================
+    // We'll only define localPlayer and remotePlayers once.
+    function createPlayerMesh(color) {
+      var geom = new THREE.BoxGeometry(1,1,1);
+      var mat = new THREE.MeshPhongMaterial({ color: color });
+      return new THREE.Mesh(geom, mat);
+    }
+    // Local player: hidden green cube with attached camera (first-person view)
+    localPlayer = createPlayerMesh(0x00ff00);
+    localPlayer.position.set(0,0,0);
+    localPlayer.visible = false;
+    scene.add(localPlayer);
+    localPlayer.add(camera);
+    camera.position.set(0,1.6,0);
+    // Remote human players (red cubes) – via Socket.IO
+    socket.on('currentPlayers', function(players) {
+      for (var id in players) {
+        if (id !== socket.id) {
+          var mesh = createPlayerMesh(0xff0000);
+          mesh.position.set(players[id].x, players[id].y || 0.5, players[id].z || 0);
+          scene.add(mesh);
+          remotePlayers[id] = mesh;
+        }
+      }
+    });
+    socket.on('newPlayer', function(playerInfo) {
+      if (playerInfo.id !== socket.id && !remotePlayers[playerInfo.id]) {
+        var mesh = createPlayerMesh(0xff0000);
+        mesh.position.set(playerInfo.x, playerInfo.y || 0.5, playerInfo.z || 0);
+        scene.add(mesh);
+        remotePlayers[playerInfo.id] = mesh;
+      }
+    });
+    // Stick figure bots (orange)
+    function createStickFigureBot(id, position) {
+      var bot = new THREE.Group();
+      var head = new THREE.Mesh(new THREE.SphereGeometry(0.25,8,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
+      head.position.y = 1.75;
+      bot.add(head);
+      var body = new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.05,0.7,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
+      body.position.y = 1.25;
+      bot.add(body);
+      var leftArm = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.5,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
+      leftArm.position.set(-0.3,1.35,0);
+      leftArm.rotation.z = Math.PI/2;
+      bot.add(leftArm);
+      var rightArm = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.5,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
+      rightArm.position.set(0.3,1.35,0);
+      rightArm.rotation.z = Math.PI/2;
+      bot.add(rightArm);
+      var leftLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.7,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
+      leftLeg.position.set(-0.15,0.65,0);
+      bot.add(leftLeg);
+      var rightLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.7,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
+      rightLeg.position.set(0.15,0.65,0);
+      bot.add(rightLeg);
+      bot.userData = {
+        leftArm: leftArm,
+        rightArm: rightArm,
+        leftLeg: leftLeg,
+        rightLeg: rightLeg,
+        walkPhase: Math.random()*Math.PI*2
+      };
+      bot.position.copy(position);
+      return bot;
+    }
+    for (var i = 1; i <= 3; i++) {
+      var botId = "bot_" + i;
+      var pos = new THREE.Vector3((Math.random()-0.5)*20, 0, (Math.random()-0.5)*20);
+      var bot = createStickFigureBot(botId, pos);
+      scene.add(bot);
+      remotePlayers[botId] = bot;
+    }
+    function updateBots() {
+      for (var id in remotePlayers) {
+        if (id.startsWith("bot_")) {
+          var bot = remotePlayers[id];
+          bot.position.x += (Math.random()-0.5)*0.05;
+          bot.position.z += (Math.random()-0.5)*0.05;
+          if (bot.userData) {
+            bot.userData.walkPhase += 0.1;
+            var amp = 0.3;
+            if (bot.userData.leftArm) { bot.userData.leftArm.rotation.x = Math.sin(bot.userData.walkPhase)*amp; }
+            if (bot.userData.rightArm) { bot.userData.rightArm.rotation.x = -Math.sin(bot.userData.walkPhase)*amp; }
+            if (bot.userData.leftLeg) { bot.userData.leftLeg.rotation.x = -Math.sin(bot.userData.walkPhase)*amp; }
+            if (bot.userData.rightLeg) { bot.userData.rightLeg.rotation.x = Math.sin(bot.userData.walkPhase)*amp; }
+          }
+        }
+      }
+    }
+
+    // ====================================================
+    // Door Interaction
+    // ====================================================
+    document.addEventListener('keydown', function(event) {
+      if (event.key === 'e' || event.key === 'E') {
+        for (var key in doorObjects) {
+          var door = doorObjects[key];
+          var dist = localPlayer.position.distanceTo(door.userData.closedPos);
+          if (dist < 2) { toggleDoor(door); }
+        }
+      }
+    });
+    function toggleDoor(door) {
+      if (!door.userData.isOpen) {
+        door.position.copy(door.userData.openPos);
+        door.userData.isOpen = true;
+      } else {
+        door.position.copy(door.userData.closedPos);
+        door.userData.isOpen = false;
+      }
+      door.userData.box = new THREE.Box3().setFromObject(door);
+    }
+
+    // ====================================================
+    // Sliding Collision Resolution
+    // ====================================================
+    // Using a bounding sphere (radius 0.5) for the local player, push it out of collisions.
+    function resolveCollisions(pos, radius) {
+      var corrected = pos.clone();
+      for (var i = 0; i < collisionWalls.length; i++) {
+        var box = collisionWalls[i].userData.box;
+        var closest = new THREE.Vector3(
+          THREE.MathUtils.clamp(corrected.x, box.min.x, box.max.x),
+          THREE.MathUtils.clamp(corrected.y, box.min.y, box.max.y),
+          THREE.MathUtils.clamp(corrected.z, box.min.z, box.max.z)
+        );
+        var delta = corrected.clone().sub(closest);
+        var dist = delta.length();
+        if (dist < radius) {
+          var penetration = radius - dist;
+          if (dist < 0.0001) {
+            delta.set(1,0,0);
+            dist = 1;
+          }
+          var correction = delta.normalize().multiplyScalar(penetration);
+          corrected.add(correction);
+        }
+      }
+      return corrected;
+    }
+
+    // ====================================================
+    // Movement Controls for Local Player (with Sliding)
+    // ====================================================
+    var keys = {};
+    document.addEventListener('keydown', function(event) {
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
+        event.preventDefault();
+      }
+      keys[event.key] = true;
+    });
+    document.addEventListener('keyup', function(event) {
+      keys[event.key] = false;
+    });
+    function updatePlayerMovement() {
+      var speed = 0.1;
+      var rotSpeed = 0.05;
+      var oldPos = localPlayer.position.clone();
+      if (keys['ArrowLeft'] || keys['a'] || keys['A']) {
+        localPlayer.rotation.y += rotSpeed;
+      }
+      if (keys['ArrowRight'] || keys['d'] || keys['D']) {
+        localPlayer.rotation.y -= rotSpeed;
+      }
+      var forward = new THREE.Vector3(0,0,-1);
+      forward.applyQuaternion(localPlayer.quaternion);
+      if (keys['ArrowUp'] || keys['w'] || keys['W']) {
+        localPlayer.position.add(forward.clone().multiplyScalar(speed));
+      }
+      if (keys['ArrowDown'] || keys['s'] || keys['S']) {
+        localPlayer.position.add(forward.clone().multiplyScalar(-speed));
+      }
+      // Slide: resolve collisions
+      var resolvedPos = resolveCollisions(localPlayer.position, 0.5);
+      localPlayer.position.copy(resolvedPos);
+      socket.emit('playerMovement', {
+        x: localPlayer.position.x,
+        y: localPlayer.position.y,
+        z: localPlayer.position.z
+      });
+    }
+
+    // ====================================================
+    // Animation Loop
+    // ====================================================
+    function animate() {
+      requestAnimationFrame(animate);
+      updatePlayerMovement();
+      updateBots();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ====================================================
+    // Resize Handler
+    // ====================================================
+    window.addEventListener('resize', function() {
+      camera.aspect = window.innerWidth/window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
