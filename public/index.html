@@ -31,12 +31,21 @@
     }
     #playersList { margin-bottom: 20px; max-height: 200px; overflow-y: auto; }
     button { padding: 10px 20px; font-size: 16px; }
+    /* Chat/Guess box styling */
+    #guessContainer { margin-top: 10px; }
   </style>
 </head>
 <body>
   <!-- UI Message -->
   <div id="uiContainer">
     <div id="gameStatus">Connecting...</div>
+    <div id="gameMessage"></div>
+    <div id="timer"></div>
+    <!-- Guess submission UI; initially hidden -->
+    <div id="guessContainer" style="display:none;">
+      <input type="text" id="guessInput" placeholder="Enter your mark (Spades, Diamonds, Clubs, Hearts)" />
+      <button id="submitGuessButton">Submit Guess</button>
+    </div>
   </div>
   <!-- Waiting Room Overlay -->
   <div id="waitingRoom">
@@ -56,8 +65,21 @@
     var collisionWalls = [];    // All solid walls & closed doors
     var doorObjects = {};       // Doors keyed by a string ID
     var remotePlayers = {};     // Remote players and bots (keyed by their ID)
+    var booths = [];            // Booth objects (for guess submission in cells)
     var localPlayer;            // Our local (hidden) player
     var camera, scene, renderer;  // Three.js essentials
+
+    // Global flag: are we in confinement phase?
+    var inConfinementPhase = false;
+
+    // UI Elements for messages and countdown timer.
+    var gameStatusEl = document.getElementById('gameStatus');
+    var gameMessageEl = document.getElementById('gameMessage');
+    var timerEl = document.getElementById('timer');
+    var guessContainerEl = document.getElementById('guessContainer');
+    var guessInputEl = document.getElementById('guessInput');
+    var submitGuessButton = document.getElementById('submitGuessButton');
+    var countdownInterval = null;
 
     // ====================================================
     // Socket.IO & Waiting Room Setup
@@ -65,7 +87,7 @@
     var socket = io();
     socket.on('connect', function() {
       console.log('Connected with ID:', socket.id);
-      document.getElementById('gameStatus').textContent = "Connected. Waiting for game start...";
+      gameStatusEl.textContent = "Connected. Waiting for game start...";
     });
     var waitingRoomDiv = document.getElementById("waitingRoom");
     var playersList = document.getElementById("playersList");
@@ -78,17 +100,82 @@
     socket.on('waitingRoomUpdate', function(readyStates) {
       playersList.innerHTML = '';
       for (var id in readyStates) {
-        var div = document.createElement('div');
-        div.textContent = id + ': ' + (readyStates[id] ? 'Ready' : 'Not Ready');
-        playersList.appendChild(div);
+        if (readyStates.hasOwnProperty(id)) {
+          var div = document.createElement('div');
+          div.textContent = id + ': ' + (readyStates[id] ? 'Ready' : 'Not Ready');
+          playersList.appendChild(div);
+        }
       }
     });
     socket.on('gameStarting', function() {
       waitingRoomDiv.style.display = 'none';
+      gameMessageEl.textContent = "Game Starting...";
     });
-    socket.on('playerMoved', function(data) {
-      if (remotePlayers[data.id]) {
-        remotePlayers[data.id].position.set(data.x, data.y, data.z);
+
+    // ----------------------------------------------------
+    // Game Events: round and confinement phases
+    // ----------------------------------------------------
+    socket.on('roundStarted', function(data) {
+      // data: { round: number, duration: ms }
+      inConfinementPhase = false;
+      gameMessageEl.textContent = "Round " + data.round + " started!";
+      startCountdown(data.duration);
+      guessContainerEl.style.display = 'none';
+    });
+
+    socket.on('confinementStarted', function(data) {
+      inConfinementPhase = true;
+      gameMessageEl.textContent = "Confinement Phase: Go to a cell and press E to guess your mark!";
+      startCountdown(data.duration);
+      // Note: The guess UI will be triggered when the player presses E near a booth.
+    });
+
+    socket.on('guessReceived', function(data) {
+      gameMessageEl.textContent = "Guess submitted: " + data.guess;
+      guessContainerEl.style.display = 'none';
+    });
+
+    socket.on('eliminated', function(data) {
+      gameMessageEl.textContent = "Eliminated! Reason: " + data.reason;
+      guessContainerEl.style.display = 'none';
+    });
+
+    socket.on('survived', function(data) {
+      gameMessageEl.textContent = data.message;
+    });
+
+    socket.on('gameOver', function(data) {
+      gameMessageEl.textContent = "Game Over: " + data.message;
+      clearInterval(countdownInterval);
+      timerEl.textContent = "";
+    });
+
+    socket.on('jackAssigned', function(data) {
+      console.log("Jack of Hearts assigned to: " + data.id);
+    });
+
+    // Countdown timer function.
+    function startCountdown(duration) {
+      clearInterval(countdownInterval);
+      var remaining = Math.floor(duration / 1000);
+      timerEl.textContent = "Time remaining: " + remaining + " sec";
+      countdownInterval = setInterval(function() {
+        remaining--;
+        if (remaining <= 0) {
+          clearInterval(countdownInterval);
+          timerEl.textContent = "Time's up!";
+        } else {
+          timerEl.textContent = "Time remaining: " + remaining + " sec";
+        }
+      }, 1000);
+    }
+
+    // Listen for guess submissions.
+    submitGuessButton.addEventListener('click', function() {
+      var guess = guessInputEl.value.trim();
+      if (guess !== "") {
+        socket.emit('submitGuess', { guess: guess });
+        guessContainerEl.style.display = 'none';
       }
     });
 
@@ -118,7 +205,6 @@
 
     // ====================================================
     // Helper Function: addWall
-    // Creates a wall, adds it to scene, computes bounding box, stores in collisionWalls.
     // ====================================================
     function addWall(x, y, z, width, height, depth, rotationY) {
       var geom = new THREE.BoxGeometry(width, height, depth);
@@ -135,7 +221,7 @@
     }
 
     // ====================================================
-    // Jail Layout: Big Room & Side Rooms
+    // Jail Layout: Big Room & Side Rooms (Cells)
     // ====================================================
     // Outer walls of big room:
     addWall(0, 2.5, -halfDepth, roomWidth, 5, 1); // North wall at z = -10
@@ -143,21 +229,15 @@
     addWall(-halfWidth, 2.5, 0, roomDepth, 5, 1, Math.PI/2); // West wall at x = -10
     addWall(halfWidth, 2.5, 0, roomDepth, 5, 1, Math.PI/2);   // East wall at x = 10
 
-    // We'll use the north wall (at z = -10) as the dividing wall for side rooms.
-    // Attach 5 rooms on the east side and 5 on the west side along the north wall.
-    // For simplicity, we assume that the dividing wall is the north outer wall.
-    // Each room is 4m (width) x 4m (depth). Rooms are arranged along the north wall.
+    // Side Rooms (Cells): Using the north wall as divider.
     var numRooms = 5;
     var roomSize = 4;
-    // For west side rooms (they extend from x = -10 to -6)
+    // West side rooms.
     for (var i = 0; i < numRooms; i++) {
-      var z_center = -halfDepth + roomSize/2 + i * roomSize; // from z = -10 upward
-      // Build room walls (west room: cell extends from x = -10 to -6)
-      // East wall of room will be along the dividing wall and will contain a door.
-      addWall(-8, 1.5, z_center, roomSize, 3, 0.2); // West wall of room (inside room)
-      addWall(-8, 1.5, z_center - roomSize/2, roomSize, 3, 0.2); // North wall of room
-      addWall(-8, 1.5, z_center + roomSize/2, roomSize, 3, 0.2); // South wall of room
-      // Door on east side (attached to dividing wall at x = -10)
+      var z_center = -halfDepth + roomSize/2 + i * roomSize;
+      addWall(-8, 1.5, z_center, roomSize, 3, 0.2); // West wall of cell
+      addWall(-8, 1.5, z_center - roomSize/2, roomSize, 3, 0.2); // North wall
+      addWall(-8, 1.5, z_center + roomSize/2, roomSize, 3, 0.2); // South wall
       var doorGeom = new THREE.BoxGeometry(1, 3, 0.2);
       var doorMat = new THREE.MeshPhongMaterial({ color: 0x4444ff });
       var door = new THREE.Mesh(doorGeom, doorMat);
@@ -171,15 +251,20 @@
       door.userData.box = new THREE.Box3().setFromObject(door);
       collisionWalls.push(door);
       doorObjects["west_"+i] = door;
+      // Add a booth (yellow box) in the center of the cell.
+      var boothGeom = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+      var boothMat = new THREE.MeshPhongMaterial({ color: 0xffff00 });
+      var booth = new THREE.Mesh(boothGeom, boothMat);
+      booth.position.set(-8, 0.25, z_center);
+      scene.add(booth);
+      booths.push(booth);
     }
-    // For east side rooms (they extend from x = 6 to 10)
+    // East side rooms.
     for (var i = 0; i < numRooms; i++) {
       var z_center = -halfDepth + roomSize/2 + i * roomSize;
-      // Build room walls (east room: cell extends from x = 6 to 10)
-      addWall(8, 1.5, z_center, roomSize, 3, 0.2); // East wall (inside room)
+      addWall(8, 1.5, z_center, roomSize, 3, 0.2); // East wall of cell
       addWall(8, 1.5, z_center - roomSize/2, roomSize, 3, 0.2); // North wall
       addWall(8, 1.5, z_center + roomSize/2, roomSize, 3, 0.2); // South wall
-      // Door on west side (attached to dividing wall at x = 10)
       var doorGeom = new THREE.BoxGeometry(1, 3, 0.2);
       var doorMat = new THREE.MeshPhongMaterial({ color: 0x4444ff });
       var door = new THREE.Mesh(doorGeom, doorMat);
@@ -193,110 +278,222 @@
       door.userData.box = new THREE.Box3().setFromObject(door);
       collisionWalls.push(door);
       doorObjects["east_"+i] = door;
+      // Add a booth in the center of the cell.
+      var boothGeom = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+      var boothMat = new THREE.MeshPhongMaterial({ color: 0xffff00 });
+      var booth = new THREE.Mesh(boothGeom, boothMat);
+      booth.position.set(8, 0.25, z_center);
+      scene.add(booth);
+      booths.push(booth);
+    }
+
+    // ====================================================
+    // Helper Function: Create Text Sprite
+    // ====================================================
+    function createTextSprite(message, parameters) {
+      parameters = parameters || {};
+      var fontface = parameters.fontface || "Arial";
+      var fontsize = parameters.fontsize || 24;
+      var borderThickness = parameters.borderThickness || 4;
+      var borderColor = parameters.borderColor || { r:0, g:0, b:0, a:1.0 };
+      var backgroundColor = parameters.backgroundColor || { r:255, g:255, b:255, a:1.0 };
+
+      var canvas = document.createElement('canvas');
+      var context = canvas.getContext('2d');
+      context.font = fontsize + "px " + fontface;
+      var metrics = context.measureText(message);
+      var textWidth = metrics.width;
+      
+      // Set canvas size.
+      canvas.width = textWidth + borderThickness * 2;
+      canvas.height = fontsize * 1.4 + borderThickness * 2;
+      
+      context.font = fontsize + "px " + fontface;
+      // Background
+      context.fillStyle = "rgba(" + backgroundColor.r + "," + backgroundColor.g + "," + backgroundColor.b + "," + backgroundColor.a + ")";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      // Border
+      context.strokeStyle = "rgba(" + borderColor.r + "," + borderColor.g + "," + borderColor.b + "," + borderColor.a + ")";
+      context.lineWidth = borderThickness;
+      context.strokeRect(0, 0, canvas.width, canvas.height);
+      // Text
+      context.fillStyle = "rgba(0, 0, 0, 1.0)";
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(message, canvas.width / 2, canvas.height / 2);
+
+      var texture = new THREE.Texture(canvas);
+      texture.needsUpdate = true;
+      var spriteMaterial = new THREE.SpriteMaterial({ map: texture });
+      var sprite = new THREE.Sprite(spriteMaterial);
+      sprite.scale.set(3, 1.5, 1);
+      return sprite;
+    }
+
+    // ====================================================
+    // Character Creation (for both bots and actual players)
+    // ====================================================
+    // This function creates a stick-figure character.
+    // color: the body color (e.g., 0xffaa00 for bots, 0xff0000 for players)
+    function createStickFigureCharacter(id, position, mark, color) {
+      var character = new THREE.Group();
+
+      // Head.
+      var head = new THREE.Mesh(
+        new THREE.SphereGeometry(0.25, 8, 8),
+        new THREE.MeshBasicMaterial({ color: color })
+      );
+      head.position.y = 1.75;
+      character.add(head);
+
+      // Body.
+      var body = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.05, 0.05, 0.7, 8),
+        new THREE.MeshBasicMaterial({ color: color })
+      );
+      body.position.y = 1.25;
+      character.add(body);
+
+      // Left Arm.
+      var leftArm = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.03, 0.03, 0.5, 8),
+        new THREE.MeshBasicMaterial({ color: color })
+      );
+      leftArm.position.set(-0.3, 1.35, 0);
+      leftArm.rotation.z = Math.PI / 2;
+      character.add(leftArm);
+
+      // Right Arm.
+      var rightArm = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.03, 0.03, 0.5, 8),
+        new THREE.MeshBasicMaterial({ color: color })
+      );
+      rightArm.position.set(0.3, 1.35, 0);
+      rightArm.rotation.z = Math.PI / 2;
+      character.add(rightArm);
+
+      // Left Leg.
+      var leftLeg = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.03, 0.03, 0.7, 8),
+        new THREE.MeshBasicMaterial({ color: color })
+      );
+      leftLeg.position.set(-0.15, 0.65, 0);
+      character.add(leftLeg);
+
+      // Right Leg.
+      var rightLeg = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.03, 0.03, 0.7, 8),
+        new THREE.MeshBasicMaterial({ color: color })
+      );
+      rightLeg.position.set(0.15, 0.65, 0);
+      character.add(rightLeg);
+
+      character.userData = {
+        walkPhase: Math.random() * Math.PI * 2
+      };
+
+      character.position.copy(position);
+
+      // Attach a text label above the head with the character's mark.
+      if (mark) {
+        var label = createTextSprite(mark, { fontsize: 32, borderThickness: 2 });
+        label.position.set(0, 2.3, 0);
+        character.add(label);
+      }
+      return character;
     }
 
     // ====================================================
     // Player & Bot Setup
     // ====================================================
-    // We'll only define localPlayer and remotePlayers once.
-    function createPlayerMesh(color) {
-      var geom = new THREE.BoxGeometry(1,1,1);
-      var mat = new THREE.MeshPhongMaterial({ color: color });
-      return new THREE.Mesh(geom, mat);
-    }
-    // Local player: hidden green cube with attached camera (first-person view)
-    localPlayer = createPlayerMesh(0x00ff00);
+    // Local player: hidden green cube with attached camera.
+    // (The local player remains hidden; other players see the stick-figure version.)
+    localPlayer = new THREE.Mesh(new THREE.BoxGeometry(1,1,1), new THREE.MeshPhongMaterial({ color: 0x00ff00 }));
     localPlayer.position.set(0,0,0);
     localPlayer.visible = false;
     scene.add(localPlayer);
     localPlayer.add(camera);
     camera.position.set(0,1.6,0);
-    // Remote human players (red cubes) – via Socket.IO
-    socket.on('currentPlayers', function(players) {
-      for (var id in players) {
+
+    // Remote players and bots are now created using the stick-figure style.
+    socket.on('currentPlayers', function(playersData) {
+      for (var id in playersData) {
         if (id !== socket.id) {
-          var mesh = createPlayerMesh(0xff0000);
-          mesh.position.set(players[id].x, players[id].y || 0.5, players[id].z || 0);
-          scene.add(mesh);
-          remotePlayers[id] = mesh;
+          var pos = new THREE.Vector3(playersData[id].x, playersData[id].y || 0.5, playersData[id].z || 0);
+          // Use orange for bots and red for actual players.
+          var color = (id.indexOf("bot_") === 0) ? 0xffaa00 : 0xff0000;
+          var character = createStickFigureCharacter(id, pos, playersData[id].mark, color);
+          scene.add(character);
+          remotePlayers[id] = character;
         }
       }
     });
+
     socket.on('newPlayer', function(playerInfo) {
       if (playerInfo.id !== socket.id && !remotePlayers[playerInfo.id]) {
-        var mesh = createPlayerMesh(0xff0000);
-        mesh.position.set(playerInfo.x, playerInfo.y || 0.5, playerInfo.z || 0);
-        scene.add(mesh);
-        remotePlayers[playerInfo.id] = mesh;
+        var pos = new THREE.Vector3(playerInfo.x, playerInfo.y || 0.5, playerInfo.z || 0);
+        var color = (playerInfo.id.indexOf("bot_") === 0) ? 0xffaa00 : 0xff0000;
+        var character = createStickFigureCharacter(playerInfo.id, pos, playerInfo.mark, color);
+        scene.add(character);
+        remotePlayers[playerInfo.id] = character;
       }
     });
-    // Stick figure bots (orange)
-    function createStickFigureBot(id, position) {
-      var bot = new THREE.Group();
-      var head = new THREE.Mesh(new THREE.SphereGeometry(0.25,8,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
-      head.position.y = 1.75;
-      bot.add(head);
-      var body = new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.05,0.7,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
-      body.position.y = 1.25;
-      bot.add(body);
-      var leftArm = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.5,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
-      leftArm.position.set(-0.3,1.35,0);
-      leftArm.rotation.z = Math.PI/2;
-      bot.add(leftArm);
-      var rightArm = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.5,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
-      rightArm.position.set(0.3,1.35,0);
-      rightArm.rotation.z = Math.PI/2;
-      bot.add(rightArm);
-      var leftLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.7,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
-      leftLeg.position.set(-0.15,0.65,0);
-      bot.add(leftLeg);
-      var rightLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.7,8), new THREE.MeshBasicMaterial({ color: 0xffaa00 }));
-      rightLeg.position.set(0.15,0.65,0);
-      bot.add(rightLeg);
-      bot.userData = {
-        leftArm: leftArm,
-        rightArm: rightArm,
-        leftLeg: leftLeg,
-        rightLeg: rightLeg,
-        walkPhase: Math.random()*Math.PI*2
-      };
-      bot.position.copy(position);
-      return bot;
-    }
-    for (var i = 1; i <= 3; i++) {
-      var botId = "bot_" + i;
-      var pos = new THREE.Vector3((Math.random()-0.5)*20, 0, (Math.random()-0.5)*20);
-      var bot = createStickFigureBot(botId, pos);
-      scene.add(bot);
-      remotePlayers[botId] = bot;
-    }
+
+    socket.on('playerMoved', function(data) {
+      if (remotePlayers[data.id]) {
+        remotePlayers[data.id].position.set(data.x, data.y, data.z);
+      }
+    });
+
+    // ====================================================
+    // Stick Figure Characters Movement (Bots Animation)
+    // ====================================================
     function updateBots() {
       for (var id in remotePlayers) {
-        if (id.startsWith("bot_")) {
-          var bot = remotePlayers[id];
-          bot.position.x += (Math.random()-0.5)*0.05;
-          bot.position.z += (Math.random()-0.5)*0.05;
-          if (bot.userData) {
-            bot.userData.walkPhase += 0.1;
+        if (id.indexOf("bot_") === 0) {
+          var character = remotePlayers[id];
+          character.position.x += (Math.random()-0.5)*0.05;
+          character.position.z += (Math.random()-0.5)*0.05;
+          if (character.userData) {
+            character.userData.walkPhase += 0.1;
             var amp = 0.3;
-            if (bot.userData.leftArm) { bot.userData.leftArm.rotation.x = Math.sin(bot.userData.walkPhase)*amp; }
-            if (bot.userData.rightArm) { bot.userData.rightArm.rotation.x = -Math.sin(bot.userData.walkPhase)*amp; }
-            if (bot.userData.leftLeg) { bot.userData.leftLeg.rotation.x = -Math.sin(bot.userData.walkPhase)*amp; }
-            if (bot.userData.rightLeg) { bot.userData.rightLeg.rotation.x = Math.sin(bot.userData.walkPhase)*amp; }
+            // For simplicity, animate arms and legs:
+            if (character.children.length >= 6) {
+              character.children[2].rotation.x = Math.sin(character.userData.walkPhase)*amp; // leftArm
+              character.children[3].rotation.x = -Math.sin(character.userData.walkPhase)*amp; // rightArm
+              character.children[4].rotation.x = -Math.sin(character.userData.walkPhase)*amp; // leftLeg
+              character.children[5].rotation.x = Math.sin(character.userData.walkPhase)*amp; // rightLeg
+            }
           }
         }
       }
     }
 
     // ====================================================
-    // Door Interaction
+    // Door & Booth Interaction
     // ====================================================
     document.addEventListener('keydown', function(event) {
+      // When pressing E:
       if (event.key === 'e' || event.key === 'E') {
+        // If in confinement phase, check if near any booth
+        if (inConfinementPhase) {
+          for (var i = 0; i < booths.length; i++) {
+            var booth = booths[i];
+            var dist = localPlayer.position.distanceTo(booth.position);
+            if (dist < 2) {
+              // Player is near a booth in a cell, so show the guess UI.
+              guessContainerEl.style.display = 'block';
+              return; // Exit so we don't also toggle any doors.
+            }
+          }
+        }
+        // Otherwise, process door toggling as usual.
         for (var key in doorObjects) {
           var door = doorObjects[key];
           var dist = localPlayer.position.distanceTo(door.userData.closedPos);
-          if (dist < 2) { toggleDoor(door); }
+          if (dist < 2) { 
+            toggleDoor(door);
+          }
         }
       }
     });
@@ -314,7 +511,6 @@
     // ====================================================
     // Sliding Collision Resolution
     // ====================================================
-    // Using a bounding sphere (radius 0.5) for the local player, push it out of collisions.
     function resolveCollisions(pos, radius) {
       var corrected = pos.clone();
       for (var i = 0; i < collisionWalls.length; i++) {
@@ -344,7 +540,7 @@
     // ====================================================
     var keys = {};
     document.addEventListener('keydown', function(event) {
-      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].indexOf(event.key) !== -1) {
         event.preventDefault();
       }
       keys[event.key] = true;
@@ -355,7 +551,6 @@
     function updatePlayerMovement() {
       var speed = 0.1;
       var rotSpeed = 0.05;
-      var oldPos = localPlayer.position.clone();
       if (keys['ArrowLeft'] || keys['a'] || keys['A']) {
         localPlayer.rotation.y += rotSpeed;
       }
@@ -370,7 +565,6 @@
       if (keys['ArrowDown'] || keys['s'] || keys['S']) {
         localPlayer.position.add(forward.clone().multiplyScalar(-speed));
       }
-      // Slide: resolve collisions
       var resolvedPos = resolveCollisions(localPlayer.position, 0.5);
       localPlayer.position.copy(resolvedPos);
       socket.emit('playerMovement', {
