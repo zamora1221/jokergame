@@ -35,20 +35,25 @@ function assignRandomMark() {
 }
 
 function assignJackOfHearts() {
+  // Gather all alive players
   let alivePlayers = [];
   for (let id in players) {
     if (players[id].alive) {
       alivePlayers.push(players[id]);
     }
   }
+  // If a Jack is already assigned, do nothing.
   for (let i = 0; i < alivePlayers.length; i++) {
     if (alivePlayers[i].role === 'Jack') return;
   }
   if (alivePlayers.length > 0) {
     let randomIndex = Math.floor(Math.random() * alivePlayers.length);
-    alivePlayers[randomIndex].role = 'Jack';
-    console.log(`Assigned Jack of Hearts: ${alivePlayers[randomIndex].id}`);
-    io.emit('jackAssigned', { id: alivePlayers[randomIndex].id });
+    let jackPlayer = alivePlayers[randomIndex];
+    jackPlayer.role = 'Jack';
+    console.log(`Assigned Jack of Hearts: ${jackPlayer.id}`);
+    io.emit('jackAssigned', { id: jackPlayer.id });
+    // Inform the jack that they are the Jack of Hearts and tell them their mark.
+    io.to(jackPlayer.id).emit('jackRole', { mark: jackPlayer.mark });
   }
 }
 
@@ -66,19 +71,25 @@ function updateWaitingRoom() {
 }
 
 function checkAllReady() {
+  let humanCount = 0;
   let allReady = true;
   for (let id in players) {
-    if (!players[id].isBot && players[id].alive && players[id].ready !== true) {
-      allReady = false;
-      break;
+    if (!players[id].isBot && players[id].alive) {
+      humanCount++;
+      if (players[id].ready !== true) {
+        allReady = false;
+        break;
+      }
     }
   }
-  if (allReady) {
+  // Only auto-start if there is at least one human and all humans are ready.
+  if (humanCount > 0 && allReady) {
     waitingRoom = false;
     io.emit('gameStarting');
     startRound();
   }
 }
+
 
 // ----------------------
 // Game Loop Functions
@@ -87,6 +98,7 @@ function startRound() {
   gameInProgress = true;
   console.log(`Starting round ${currentRound}`);
 
+  // Reset guesses and assign new marks
   for (let id in players) {
     if (players[id].alive) {
       players[id].guess = null;
@@ -94,9 +106,14 @@ function startRound() {
       if (!players[id].isBot) {
         players[id].ready = false;
       }
+      // Reset role for non-Jack players (if needed)
+      if (players[id].role !== 'Jack') {
+        players[id].role = null;
+      }
     }
   }
 
+  // Randomly assign the Jack of Hearts if no one is already the Jack.
   assignJackOfHearts();
 
   io.emit('roundStarted', { round: currentRound, duration: roundDuration });
@@ -111,6 +128,7 @@ function startConfinement() {
   console.log("Confinement phase started.");
   io.emit('confinementStarted', { duration: confinementDuration });
 
+  // Bots simulate guesses.
   for (let id in players) {
     if (players[id].alive && players[id].isBot) {
       let delay = Math.floor(Math.random() * confinementDuration);
@@ -150,6 +168,7 @@ function evaluateGuesses() {
     }
   }
 
+  // Game end conditions
   let jackAlive = false;
   for (let id in players) {
     if (players[id].role === 'Jack' && players[id].alive) {
@@ -196,7 +215,7 @@ function evaluateGuesses() {
 io.on('connection', (socket) => {
   console.log(`Player connected: ${socket.id}`);
 
-  // For players, assign positions within a 20x20 room (x and z between -10 and 10)
+  // Assign positions within a 20x20 room (x and z between -10 and 10)
   players[socket.id] = {
     id: socket.id,
     x: Math.random() * 20 - 10,
@@ -220,6 +239,10 @@ io.on('connection', (socket) => {
     let remaining = Math.max(roundDuration - elapsed, 0);
     socket.emit('roundStarted', { round: currentRound, duration: remaining });
   }
+  socket.on('voiceSignal', (data) => {
+  // Relay the voice signal to the intended recipient.
+  io.to(data.to).emit('voiceSignal', data);
+});
 
   socket.on('chatMessage', (data) => {
     io.emit('chatMessage', { sender: players[socket.id].id, message: data.message });
@@ -291,7 +314,7 @@ setInterval(() => {
   for (let id in players) {
     if (players[id].isBot && players[id].alive) {
       let bot = players[id];
-      const speed = 0.2; // smaller speed for 3D room
+      const speed = 0.2; // Adjusted speed for the 3D room
       let dx = (Math.random() - 0.5) * speed;
       let dz = (Math.random() - 0.5) * speed;
       bot.x += dx;
